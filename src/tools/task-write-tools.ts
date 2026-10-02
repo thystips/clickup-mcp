@@ -182,7 +182,7 @@ const customFieldsSchema = z
         .optional()
         .describe("Exact custom field id, used when a name is ambiguous. Takes precedence over `name`."),
       value: customFieldValueSchema.describe(
-        "Value to set. drop_down: option name or id. labels: option name/id or array. users: user id, email or exact username (or `{add:[...],rem:[...]}` to revoke). checkbox: true/false. date: ISO string or epoch ms. number: number. text: string. null clears the field."
+        "Value to set. drop_down: option name or id. labels: option name/id or array. users: user id, email or exact username (or `{add:[...],rem:[...]}` to change members). checkbox: true/false. date: ISO string or epoch ms. number: number. text: string. null clears the field (for users, pass `{add,rem}` instead)."
       ),
     })
   )
@@ -650,19 +650,32 @@ export function registerTaskToolsWrite(server: McpServer, userData: any) {
         }
 
         // If only tags, dependencies or custom fields were updated, fetch the task
-        // again to get the updated state
+        // again to get the updated state. A refresh failure must not be reported
+        // as a failed update: the writes already happened, so keep the result and
+        // surface the refresh problem as a warning instead.
+        let refreshWarning: string | undefined;
         if ((tags !== undefined || blocking !== undefined || waiting_on !== undefined || linked_tasks !== undefined || custom_fields !== undefined) && Object.keys(updateBody).length === 0) {
-          const refreshResponse = await fetch(`https://api.clickup.com/api/v2/task/${task_id}`, {
-            headers: { Authorization: CONFIG.apiKey },
-          });
-          if (refreshResponse.ok) {
-            updatedTask = await refreshResponse.json();
+          try {
+            const refreshResponse = await fetch(`https://api.clickup.com/api/v2/task/${task_id}`, {
+              headers: { Authorization: CONFIG.apiKey },
+            });
+            if (refreshResponse.ok) {
+              updatedTask = await refreshResponse.json();
+            } else {
+              refreshWarning = `Failed to refresh task: ${refreshResponse.status} ${refreshResponse.statusText}`;
+            }
+          } catch (error) {
+            refreshWarning = `Error refreshing task: ${error instanceof Error ? error.message : String(error)}`;
           }
         }
 
         const responseLines = formatTaskResponse(updatedTask, 'updated', {
           name, description, append_description, status, priority, due_date, start_date, time_estimate, tags, parent_task_id, assignees, blocking, waiting_on, linked_tasks
         }, userData);
+
+        if (refreshWarning) {
+          responseLines.push(`refresh_warnings: ${refreshWarning}`);
+        }
 
         if (description !== undefined) {
           const previousLength = (taskData.markdown_description || "").length;

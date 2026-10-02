@@ -323,3 +323,122 @@ test("getListCustomFields tool lists fields, options and writability", async (t)
   t.mock.timers.runAll();
   t.mock.timers.reset();
 });
+
+test("an unknown field id fails even when a valid name is supplied", async (t) => {
+  t.mock.timers.enable();
+  const { clearCustomFieldCaches, resolveCustomFields } = await loadCustomFields();
+  clearCustomFieldCaches();
+
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+  mockAgent
+    .get("https://api.clickup.com")
+    .intercept({ path: "/api/v2/list/list123/field", method: "GET" })
+    .reply(200, { fields: FIELDS });
+
+  await assert.rejects(
+    () => resolveCustomFields("list123", [{ id: "does-not-exist", name: "Customer", value: "x" }]),
+    /Unknown custom field id "does-not-exist"/
+  );
+
+  await mockAgent.close();
+  t.mock.timers.runAll();
+  t.mock.timers.reset();
+});
+
+test("null clears a text field and is rejected for a users field", async (t) => {
+  t.mock.timers.enable();
+  const { clearCustomFieldCaches, resolveCustomFields } = await loadCustomFields();
+  clearCustomFieldCaches();
+
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+  mockAgent
+    .get("https://api.clickup.com")
+    .intercept({ path: "/api/v2/list/list123/field", method: "GET" })
+    .reply(200, { fields: FIELDS });
+
+  const [cleared] = await resolveCustomFields("list123", [{ name: "Customer", value: null }]);
+  assert.equal(cleared.value, null);
+  assert.equal(cleared.display, "(cleared)");
+
+  // A users field cannot be cleared from a null alone (the `rem` half needs the
+  // current members), and the rejection happens before any team API call.
+  await assert.rejects(
+    () => resolveCustomFields("list123", [{ name: "Requester", value: null }]),
+    /is a users field - pass \{ add: \[\.\.\.\], rem: \[\.\.\.\] \}/
+  );
+
+  await mockAgent.close();
+  t.mock.timers.runAll();
+  t.mock.timers.reset();
+});
+
+test("a rejected list-field fetch is not cached", async (t) => {
+  t.mock.timers.enable();
+  const { clearCustomFieldCaches, getListCustomFields } = await loadCustomFields();
+  clearCustomFieldCaches();
+
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+  const client = mockAgent.get("https://api.clickup.com");
+  client.intercept({ path: "/api/v2/list/list123/field", method: "GET" }).reply(500, {});
+  client.intercept({ path: "/api/v2/list/list123/field", method: "GET" }).reply(200, { fields: FIELDS });
+
+  await assert.rejects(() => getListCustomFields("list123"), /Error fetching custom fields for list list123/);
+  await Promise.resolve();
+
+  const fields = await getListCustomFields("list123");
+  assert.equal(fields.length, FIELDS.length);
+
+  await mockAgent.close();
+  t.mock.timers.runAll();
+  t.mock.timers.reset();
+});
+
+test("updateTask keeps the custom-field result when the refresh fails", async (t) => {
+  t.mock.timers.enable();
+  const { clearCustomFieldCaches } = await loadCustomFields();
+  clearCustomFieldCaches();
+
+  const { registerTaskToolsWrite } = await import("../tools/task-write-tools");
+
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+  const client = mockAgent.get("https://api.clickup.com");
+
+  client.intercept({ path: "/api/v2/user", method: "GET" }).reply(200, { user: { id: "u1", username: "me" } });
+  client.intercept({ path: "/api/v2/task/task999?include_markdown_description=true", method: "GET" }).reply(200, {
+    id: "task999",
+    name: "Acme",
+    status: { status: "open" },
+    assignees: [],
+    list: { id: "list123", name: "Customers" },
+    markdown_description: "",
+    tags: [],
+  });
+  client.intercept({ path: "/api/v2/list/list123/field", method: "GET" }).reply(200, { fields: FIELDS });
+  client.intercept({ path: "/api/v2/task/task999/field/f2", method: "POST" }).reply(200, {});
+  // The refresh after the write fails - the write itself must still be reported.
+  client.intercept({ path: "/api/v2/task/task999", method: "GET" }).reply(503, {});
+
+  const { tools, serverStub } = makeServerStub();
+  registerTaskToolsWrite(serverStub, { user: { username: "me", id: "u1" } });
+
+  const result = await tools.updateTask({
+    task_id: "task999",
+    custom_fields: [{ name: "Domain", value: "Network" }],
+  });
+  const text = result.content[0].text;
+
+  assert.match(text, /🧩 Domain: Network/);
+  assert.match(text, /refresh_warnings: Failed to refresh task: 503/);
+
+  await mockAgent.close();
+  t.mock.timers.runAll();
+  t.mock.timers.reset();
+});

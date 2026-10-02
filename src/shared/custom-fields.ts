@@ -140,7 +140,18 @@ export async function getListCustomFields(listId: string): Promise<ClickUpCustom
     return (data.fields || []) as ClickUpCustomField[];
   })();
   fieldCache.set(listId, promise);
-  setTimeout(() => fieldCache.delete(listId), CACHE_TTL_MS).unref?.();
+  // Never keep a rejected promise cached: a transient API error would otherwise
+  // make every field lookup fail for the whole TTL, even after the API recovers.
+  promise.catch(() => {
+    if (fieldCache.get(listId) === promise) {
+      fieldCache.delete(listId);
+    }
+  });
+  setTimeout(() => {
+    if (fieldCache.get(listId) === promise) {
+      fieldCache.delete(listId);
+    }
+  }, CACHE_TTL_MS).unref?.();
   return promise;
 }
 
@@ -149,7 +160,7 @@ async function getTeamMemberDirectory(): Promise<TeamMember[]> {
   if (memberDirectoryPromise) {
     return memberDirectoryPromise;
   }
-  memberDirectoryPromise = (async () => {
+  const request = (async () => {
     const response = await fetch(`https://api.clickup.com/api/v2/team`, {
       headers: { Authorization: CONFIG.apiKey },
     });
@@ -158,8 +169,15 @@ async function getTeamMemberDirectory(): Promise<TeamMember[]> {
       return [];
     }
     const data = await response.json();
-    const team = (data.teams || []).find((t: any) => t.id === CONFIG.teamId) || (data.teams || [])[0];
-    const members: TeamMember[] = (team?.members || [])
+    // Only ever resolve users within the configured team. Falling back to the
+    // first returned team would silently resolve a user reference (or leak its
+    // members in an error) from another workspace the token can see.
+    const team = (data.teams || []).find((t: any) => t.id === CONFIG.teamId);
+    if (!team || !Array.isArray(team.members)) {
+      console.error(`Team ${CONFIG.teamId} was not found in the teams response`);
+      return [];
+    }
+    const members: TeamMember[] = team.members
       .map((member: any) => member.user)
       .filter(Boolean)
       .map((user: any) => ({
@@ -170,10 +188,24 @@ async function getTeamMemberDirectory(): Promise<TeamMember[]> {
       }));
     return members;
   })();
-  setTimeout(() => {
-    memberDirectoryPromise = null;
-  }, CACHE_TTL_MS).unref?.();
-  return memberDirectoryPromise;
+  memberDirectoryPromise = request;
+  // A failed or empty directory must not be cached either, otherwise a single
+  // transient error turns every user lookup into "Unknown user" for the TTL.
+  const evict = () => {
+    if (memberDirectoryPromise === request) {
+      memberDirectoryPromise = null;
+    }
+  };
+  request.then(
+    (members) => {
+      if (members.length === 0) {
+        evict();
+      }
+    },
+    evict
+  );
+  setTimeout(evict, CACHE_TTL_MS).unref?.();
+  return request;
 }
 
 /**
@@ -190,9 +222,9 @@ function resolveField(fields: ClickUpCustomField[], input: CustomFieldInput): Cl
     if (byId) {
       return byId;
     }
-    if (!input.name) {
-      throw new Error(`Unknown custom field id "${input.id}". Available fields: ${describeFieldNames(fields)}`);
-    }
+    // `id` is documented as taking precedence over `name`: an unknown id must
+    // fail loudly rather than silently target whatever `name` happens to match.
+    throw new Error(`Unknown custom field id "${input.id}". Available fields: ${describeFieldNames(fields)}`);
   }
   const key = normalizeFieldKey(reference);
   if (!key) {
@@ -268,7 +300,7 @@ async function resolveUser(member: unknown, directory: TeamMember[]): Promise<st
     return byName[0].id;
   }
   if (byName.length > 1) {
-    throw new Error(`User "${reference}" is ambiguous (${byName.map((entry) => entry.email).join(", ")}). Use the numeric user id.`);
+    throw new Error(`User "${reference}" is ambiguous (${byName.map((entry) => `${entry.username} (${entry.id})`).join(", ")}). Use the user id.`);
   }
   throw new Error(`Unknown user "${reference}". Use a workspace user id, email or exact username.`);
 }
@@ -304,6 +336,13 @@ async function coerceValue(field: ClickUpCustomField, raw: unknown): Promise<{ v
       return { value: options.map((option) => option.id), display: options.map((option) => optionLabel(option) || option.id).join(", ") };
     }
     case "users": {
+      if (isBlank(raw)) {
+        // Clearing a `users` field needs the current members to build the `rem`
+        // half, which this resolver does not read. A silent no-op would report a
+        // clear that never happened, so ask for the explicit diff instead. Checked
+        // before the directory fetch so a clear request costs no API call.
+        throw new Error(`Field "${field.name}" is a users field - pass { add: [...], rem: [...] } (null cannot clear it because the current members are unknown).`);
+      }
       const directory = await getTeamMemberDirectory();
       const resolveIds = (list: unknown[]): Promise<string[]> =>
         Promise.all(list.map((entry) => resolveUser(entry, directory)));
@@ -327,9 +366,6 @@ async function coerceValue(field: ClickUpCustomField, raw: unknown): Promise<{ v
           rem.length > 0 ? `- ${describe(rem)}` : null,
         ].filter(Boolean);
         return { value: { add, rem }, display: parts.join(" ") || "(no change)" };
-      }
-      if (isBlank(raw)) {
-        return { value: { add: [], rem: [] }, display: "(no change)" };
       }
       const ids = await resolveIds(toArray(raw));
       return { value: { add: ids, rem: [] }, display: describe(ids) };
@@ -377,6 +413,9 @@ async function coerceValue(field: ClickUpCustomField, raw: unknown): Promise<{ v
     }
     default: {
       // text / short_text / email / phone / url
+      if (isBlank(raw)) {
+        return { value: null, display: "(cleared)" };
+      }
       const text = String(raw);
       return { value: text, display: text };
     }
