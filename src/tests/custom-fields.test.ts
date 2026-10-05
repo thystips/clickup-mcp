@@ -31,6 +31,7 @@ const FIELDS = [
   { id: "f5", name: "🙋 Requester", type: "users", type_config: {} },
   { id: "f6", name: "🎯 Scope", type: "labels", type_config: { options: [{ id: "l1", label: "Reseau", orderindex: 0 }] } },
   { id: "f7", name: "📊 Progress", type: "automatic_progress", type_config: {} },
+  { id: "f8", name: "🔗 Related", type: "tasks", type_config: {} },
 ];
 
 function makeServerStub() {
@@ -81,6 +82,7 @@ test("resolveCustomFields maps names to ids and coerces every supported type", a
     { name: "Maintenance Window", value: "2026-01-02T03:04:05.000Z" },
     { name: "Requester", value: "bob@example.com" },
     { name: "🎯 Scope", value: ["Reseau"] },
+    { name: "Related", value: ["t1", "t2"] },
   ]);
 
   assert.deepEqual(
@@ -92,6 +94,7 @@ test("resolveCustomFields maps names to ids and coerces every supported type", a
       { id: "f4", value: Date.parse("2026-01-02T03:04:05.000Z") },
       { id: "f5", value: { add: ["u2"], rem: [] } },
       { id: "f6", value: ["l1"] },
+      { id: "f8", value: { add: ["t1", "t2"], rem: [] } },
     ]
   );
 
@@ -393,6 +396,76 @@ test("a rejected list-field fetch is not cached", async (t) => {
 
   const fields = await getListCustomFields("list123");
   assert.equal(fields.length, FIELDS.length);
+
+  await mockAgent.close();
+  t.mock.timers.runAll();
+  t.mock.timers.reset();
+});
+
+test("normalizeFieldKey keeps non-Latin letters so option matching cannot bleed", async (t) => {
+  t.mock.timers.enable();
+  const { normalizeFieldKey, clearCustomFieldCaches, resolveCustomFields } = await loadCustomFields();
+  clearCustomFieldCaches();
+
+  assert.equal(normalizeFieldKey("顧客"), "顧客");
+  assert.equal(normalizeFieldKey("Kunde 客户"), "kunde 客户");
+  assert.equal(normalizeFieldKey("🤝"), "");
+
+  const cjkFields = [
+    {
+      id: "c1",
+      name: "顧客",
+      type: "drop_down",
+      type_config: {
+        options: [
+          { id: "x1", name: "高", orderindex: 0 },
+          { id: "x2", name: "Low", orderindex: 1 },
+        ],
+      },
+    },
+  ];
+
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+  mockAgent
+    .get("https://api.clickup.com")
+    .intercept({ path: "/api/v2/list/list123/field", method: "GET" })
+    .reply(200, { fields: cjkFields });
+
+  const [resolved] = await resolveCustomFields("list123", [{ name: "顧客", value: "高" }]);
+  assert.equal(resolved.value, "x1");
+
+  // Before the fix, "中" normalized to "" and matched the only non-Latin option.
+  await assert.rejects(() => resolveCustomFields("list123", [{ name: "顧客", value: "中" }]), /Unknown option "中"/);
+  // An emoji-only value normalizes to "" - reject it instead of matching.
+  await assert.rejects(() => resolveCustomFields("list123", [{ name: "顧客", value: "🤝" }]), /Unknown option "🤝"/);
+
+  await mockAgent.close();
+  t.mock.timers.runAll();
+  t.mock.timers.reset();
+});
+
+test("a tasks field is written as an {add, rem} diff and cannot be cleared with null", async (t) => {
+  t.mock.timers.enable();
+  const { clearCustomFieldCaches, resolveCustomFields } = await loadCustomFields();
+  clearCustomFieldCaches();
+
+  const mockAgent = new MockAgent();
+  mockAgent.disableNetConnect();
+  setGlobalDispatcher(mockAgent);
+  mockAgent
+    .get("https://api.clickup.com")
+    .intercept({ path: "/api/v2/list/list123/field", method: "GET" })
+    .reply(200, { fields: FIELDS });
+
+  const [diff] = await resolveCustomFields("list123", [{ name: "Related", value: { add: ["t3"], rem: ["t1"] } }]);
+  assert.deepEqual(diff.value, { add: ["t3"], rem: ["t1"] });
+
+  await assert.rejects(
+    () => resolveCustomFields("list123", [{ name: "Related", value: null }]),
+    /is a tasks field - pass \{ add: \[\.\.\.\], rem: \[\.\.\.\] \}/
+  );
 
   await mockAgent.close();
   t.mock.timers.runAll();

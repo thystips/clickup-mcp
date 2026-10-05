@@ -105,13 +105,18 @@ export function clearCustomFieldCaches(): void {
  * Fold a display name into a comparison key that is insensitive to the emoji
  * prefixes ClickUp users put in front of field names ("🤝 Customer"),
  * punctuation, and accents.
+ *
+ * Letters and digits from every script are kept: stripping to ASCII would turn
+ * a CJK/Cyrillic/Greek/Arabic name into an empty key, and an empty key matches
+ * every other non-Latin option in `resolveOption` (silently writing the wrong
+ * one). Emoji and punctuation still collapse to a single space.
  */
 export function normalizeFieldKey(raw: string): string {
   return raw
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim()
     .replace(/\s+/g, " ");
 }
@@ -262,6 +267,12 @@ function resolveOption(field: ClickUpCustomField, raw: unknown): ClickUpCustomFi
     return byId;
   }
   const key = normalizeFieldKey(reference);
+  // A reference with no letters/digits (e.g. an emoji-only value) normalizes to
+  // "", which would match every option that also normalizes to "". Refuse it
+  // rather than silently picking whichever non-Latin option happens to match.
+  if (!key) {
+    throw new Error(`Unknown option "${reference}" for field "${field.name}". Valid options: ${describeOptions(field)}`);
+  }
   const byName = options.filter((option) => normalizeFieldKey(optionLabel(option)) === key);
   if (byName.length === 1) {
     return byName[0];
@@ -408,8 +419,23 @@ async function coerceValue(field: ClickUpCustomField, raw: unknown): Promise<{ v
       return { value: parsed, display: String(parsed) };
     }
     case "tasks": {
+      // ClickUp writes a `tasks` (relationship) field through the same
+      // assignees-style diff as `users` - a plain array is rejected.
+      if (isBlank(raw)) {
+        throw new Error(`Field "${field.name}" is a tasks field - pass { add: [...], rem: [...] } (null cannot clear it because the current links are unknown).`);
+      }
+      if (raw !== null && typeof raw === "object" && !Array.isArray(raw) && ("add" in raw || "rem" in raw)) {
+        const diff = raw as { add?: unknown; rem?: unknown };
+        const add = toArray(diff.add).map((entry) => String(entry));
+        const rem = toArray(diff.rem).map((entry) => String(entry));
+        const parts = [
+          add.length > 0 ? `+ ${add.join(", ")}` : null,
+          rem.length > 0 ? `- ${rem.join(", ")}` : null,
+        ].filter(Boolean);
+        return { value: { add, rem }, display: parts.join(" ") || "(no change)" };
+      }
       const ids = toArray(raw).map((entry) => String(entry));
-      return { value: ids, display: ids.join(", ") || "(none)" };
+      return { value: { add: ids, rem: [] }, display: ids.join(", ") || "(no change)" };
     }
     default: {
       // text / short_text / email / phone / url

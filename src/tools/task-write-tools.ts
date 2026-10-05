@@ -168,7 +168,7 @@ const customFieldValueSchema = z.union([
       add: z.array(z.union([z.string(), z.number()])).optional(),
       rem: z.array(z.union([z.string(), z.number()])).optional(),
     })
-    .describe("Users field diff: `add` grants, `rem` revokes (assignees-style)."),
+    .describe("Users/tasks field diff: `add` grants, `rem` revokes (assignees-style)."),
 ]);
 const customFieldsSchema = z
   .array(
@@ -182,7 +182,7 @@ const customFieldsSchema = z
         .optional()
         .describe("Exact custom field id, used when a name is ambiguous. Takes precedence over `name`."),
       value: customFieldValueSchema.describe(
-        "Value to set. drop_down: option name or id. labels: option name/id or array. users: user id, email or exact username (or `{add:[...],rem:[...]}` to change members). checkbox: true/false. date: ISO string or epoch ms. number: number. text: string. null clears the field (for users, pass `{add,rem}` instead)."
+        "Value to set. drop_down: option name or id. labels: option name/id or array. users: user id, email or exact username (or `{add:[...],rem:[...]}` to change members). tasks: task id or array of ids (or `{add:[...],rem:[...]}` to change links; null cannot clear it). checkbox: true/false. date: ISO string or epoch ms. number: number. text: string. null clears the field (for users/tasks, pass `{add,rem}` instead)."
       ),
     })
   )
